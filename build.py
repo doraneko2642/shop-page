@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 從 Fansky 商店頁抓全部商品（標題/價格/封面圖/連結），產生靜態 index.html
+# 從 Fansky 商店頁抓全部商品（標題/封面圖/連結），產生靜態 index.html
+# 價格是登入後才由前端 JS 動態換算顯示，純 curl 抓不到，故不處理價格欄位
 import re, os, subprocess, hashlib, base64, html
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -28,14 +29,12 @@ def fansky_items():
         for b in blocks:
             m_title = re.search(r'<a title="([^"]+)"[^>]*href="([^"]+)"', b)
             m_img = re.search(r'<img[^>]*src="([^"]+)"', b)
-            m_price = re.search(r">([¥$][\d,.]+)</h6>", b)
             if not (m_title and m_img):
                 continue
             out.append({
                 "title": html.unescape(m_title.group(1)),
                 "link": "https://www.fansky.net" + m_title.group(2),
                 "img": m_img.group(1),
-                "price": m_price.group(1) if m_price else "",
             })
             found += 1
         if found == 0:
@@ -82,7 +81,6 @@ TEMPLATE = """<!DOCTYPE html>
   .card img{width:100%;aspect-ratio:1/1;object-fit:cover;display:block;}
   .info{padding:.5rem .6rem;}
   .title{font-size:.76rem;line-height:1.3;height:2.6em;overflow:hidden;}
-  .price{font-size:.85rem;font-weight:700;color:#e5507f;margin-top:.3rem;}
 </style>
 </head>
 <body>
@@ -104,9 +102,8 @@ def build_html(items):
         cards.append(
             '<a class="card" href="%s" target="_blank" rel="noopener">'
             '<img src="%s" alt="" loading="lazy">'
-            '<div class="info"><div class="title">%s</div>'
-            '<div class="price">%s</div></div></a>'
-            % (html.escape(it["link"]), img_data, html.escape(it["title"]), html.escape(it["price"]))
+            '<div class="info"><div class="title">%s</div></div></a>'
+            % (html.escape(it["link"]), img_data, html.escape(it["title"]))
         )
     return TEMPLATE.replace("__CARDS__", "\n".join(cards)).replace("__COUNT__", str(len(items)))
 
