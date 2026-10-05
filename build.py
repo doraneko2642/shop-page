@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # 抓 doraneko / doraneko2 (pictSPACE) + Fansky 三間店的商品清單，產生靜態 index.html。
-# 封面圖統一使用 Fansky 的圖（pictSPACE 商品標題用模糊比對去對應 Fansky 商品取圖），
-# 找不到對應圖的項目不顯示圖片（避免配錯圖）。
+#
+# 封面圖策略（優先序）：
+#   1. 用商品詳情頁裡的 pixiv 連結精準比對 Fansky 的同一作品封面（pixiv 網址相同 = 同一作品）
+#   2. 比對不到 → 用商品名稱模糊比對 Fansky 商品取圖（容錯用，較不準）
+#   3. 還是沒有（Fansky 根本沒賣這件，例如單人日記向商品）→ 用 pictSPACE 自己的原圖
+#
 # 價格：Fansky 的價格是登入後才用前端 JS 動態換算顯示，純 curl 抓不到，故不處理。
 import re, os, subprocess, hashlib, base64, html, difflib, json
+from concurrent.futures import ThreadPoolExecutor
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(BASE, ".imgcache")
@@ -19,10 +24,21 @@ STORES = [
 ]
 
 
-def fetch(url):
-    return subprocess.check_output(
-        ["curl", "-sL", "--max-time", "30", "-A", UA, url]
-    ).decode("utf-8", "replace")
+def fetch(url, referer=None):
+    cmd = ["curl", "-sL", "--max-time", "25", "-A", UA]
+    if referer:
+        cmd += ["-e", referer]
+    cmd.append(url)
+    return subprocess.check_output(cmd).decode("utf-8", "replace")
+
+
+def extract_pixiv_id(url):
+    try:
+        text = fetch(url)
+    except Exception:
+        return None
+    m = re.search(r"pixiv\.net/artworks/(\d+)", text)
+    return m.group(1) if m else None
 
 
 def fansky_items():
@@ -56,11 +72,13 @@ def pict_items(url):
     for b in re.split(r"store-item-card", text)[1:]:
         m_name = re.search(r'data-item-keywords="([^"]*)"', b)
         m_link = re.search(r'data-action="([^"]+)"', b)
+        m_img = re.search(r'<img src="([^"]+)"', b)
         if not (m_name and m_link):
             continue
         out.append({
             "title": html.unescape(m_name.group(1)),
             "link": "https://pictspace.net" + m_link.group(1),
+            "native_img": m_img.group(1) if m_img else None,
         })
     return out
 
@@ -76,16 +94,12 @@ def core_name(title):
     return name.strip()
 
 
-def build_fansky_index(fansky_list):
-    return [(core_name(it["title"]), it) for it in fansky_list]
-
-
-def match_cover(title, fansky_index, threshold=0.38):
+def fuzzy_match(title, fansky_name_index, threshold=0.38):
     target = core_name(title)
     if not target:
         return None
     best, best_score = None, 0.0
-    for core, item in fansky_index:
+    for core, item in fansky_name_index:
         if not core:
             continue
         score = difflib.SequenceMatcher(None, target, core).ratio()
@@ -94,11 +108,15 @@ def match_cover(title, fansky_index, threshold=0.38):
     return best["img"] if best and best_score >= threshold else None
 
 
-def thumb_b64(url, width=320, q=6):
+def thumb_b64(url, referer=None, width=320, q=6):
     key = hashlib.md5(url.encode()).hexdigest()
     out_path = os.path.join(CACHE, key + ".jpg")
     if not os.path.exists(out_path):
-        raw = subprocess.check_output(["curl", "-sL", "--max-time", "30", "-A", UA, url])
+        cmd = ["curl", "-sL", "--max-time", "30", "-A", UA]
+        if referer:
+            cmd += ["-e", referer]
+        cmd.append(url)
+        raw = subprocess.check_output(cmd)
         tmp = os.path.join(CACHE, key + ".src")
         with open(tmp, "wb") as f:
             f.write(raw)
@@ -189,13 +207,12 @@ applyLang(initial);
 </html>"""
 
 
-def render_section(store, items, cover_lookup):
+def render_section(store, items_with_cover):
     cards = []
-    for it in items:
-        img_url = cover_lookup(it)
+    for it, img_url, referer in items_with_cover:
         title_attr = html.escape(it["title"])
         if img_url:
-            img_data = thumb_b64(img_url)
+            img_data = thumb_b64(img_url, referer=referer)
             img_html = '<img src="%s" alt="" loading="lazy">' % img_data
         else:
             img_html = '<div class="noimg"></div>'
@@ -212,24 +229,42 @@ def render_section(store, items, cover_lookup):
         '<input class="search" data-grid="%s" type="text">'
         '<div class="grid" id="%s">%s</div>'
         '</section>'
-    ) % (html.escape(store["label"]), len(items), grid_id, grid_id, "\n".join(cards))
+    ) % (html.escape(store["label"]), len(items_with_cover), grid_id, grid_id, "\n".join(cards))
 
 
 if __name__ == "__main__":
     fansky_list = fansky_items()
-    fansky_index = build_fansky_index(fansky_list)
+
+    # 幫 Fansky 商品各自抓它詳情頁裡的 pixiv 連結（平行抓，加速）
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        fansky_pixiv_ids = list(ex.map(lambda it: extract_pixiv_id(it["link"]), fansky_list))
+    for it, pid in zip(fansky_list, fansky_pixiv_ids):
+        it["pixiv_id"] = pid
+
+    pixiv_index = {it["pixiv_id"]: it["img"] for it in fansky_list if it["pixiv_id"]}
+    fansky_name_index = [(core_name(it["title"]), it) for it in fansky_list]
 
     sections_html = []
     counts = []
     for store in STORES:
         if store["kind"] == "fansky":
-            items = fansky_list
-            cover = lambda it: it["img"]
+            items_with_cover = [(it, it["img"], None) for it in fansky_list]
         else:
             items = pict_items(store["url"])
-            cover = lambda it: match_cover(it["title"], fansky_index)
-        sections_html.append(render_section(store, items, cover))
-        counts.append("%s=%d" % (store["key"], len(items)))
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                pict_pixiv_ids = list(ex.map(lambda it: extract_pixiv_id(it["link"]), items))
+            items_with_cover = []
+            for it, pid in zip(items, pict_pixiv_ids):
+                if pid and pid in pixiv_index:
+                    items_with_cover.append((it, pixiv_index[pid], None))
+                else:
+                    fuzzy = fuzzy_match(it["title"], fansky_name_index)
+                    if fuzzy:
+                        items_with_cover.append((it, fuzzy, None))
+                    else:
+                        items_with_cover.append((it, it.get("native_img"), "https://pictspace.net/"))
+        sections_html.append(render_section(store, items_with_cover))
+        counts.append("%s=%d" % (store["key"], len(items_with_cover)))
 
     out_html = TEMPLATE.replace("__SECTIONS__", "\n".join(sections_html)).replace(
         "__I18N_JSON__", json.dumps(I18N, ensure_ascii=False)
